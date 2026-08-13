@@ -15,27 +15,39 @@ Skill 使用 Python 标准库脚本执行确定性的文件操作，不依赖 Pi
 ## 目录结构
 
 ```text
-bios-worklog/
-├── SKILL.md
-├── scripts/
-│   └── bios_worklog.py
-├── references/
-│   ├── bios-categories.md
-│   ├── record-format.md
-│   └── workflow.md
-└── tests/
-    └── test_bios_worklog.py
+repository-root/
+├── README.md
+├── LICENSE
+├── .gitignore
+└── bios-worklog/                 # 可直接复制安装的 Skill 目录
+    ├── SKILL.md
+    ├── scripts/
+    │   └── bios_worklog.py
+    ├── references/
+    │   ├── bios-categories.md
+    │   ├── record-format.md
+    │   └── workflow.md
+    └── tests/
+        └── test_bios_worklog.py
 ```
 
 ## 安装
 
-把整个仓库克隆或复制到 Agent 支持的 Skills 目录。例如 Pi：
+下载或克隆本仓库后，只需把内层的 **`bios-worklog/` 文件夹**复制到 Agent 支持的 Skills 目录。
+
+例如 Pi：
 
 ```text
-~/.pi/agent/skills/bios-worklog/
+<本仓库>/bios-worklog/  →  ~/.pi/agent/skills/bios-worklog/
 ```
 
-随后重新加载 Skills 或重启 Agent。
+也可以直接克隆后复制：
+
+```bash
+git clone https://github.com/MaShouo/bios-worklog.git
+```
+
+随后重新加载 Skills 或重启 Agent。仓库根目录的 `README.md`、`LICENSE` 和 `.gitignore` 不需要复制到 Skills 目录。
 
 ## 初始化记录目录
 
@@ -48,7 +60,7 @@ bios-worklog/
 也可以直接运行：
 
 ```bash
-python scripts/bios_worklog.py init "D:\BIOS-KnowledgeBase"
+python bios-worklog/scripts/bios_worklog.py init "D:\BIOS-KnowledgeBase"
 ```
 
 初始化后，默认目录记录在：
@@ -98,11 +110,11 @@ BIOS-KnowledgeBase/
 ## 直接使用 CLI
 
 ```bash
-python scripts/bios_worklog.py --help
-python scripts/bios_worklog.py --json status
-python scripts/bios_worklog.py --json list --status investigating
-python scripts/bios_worklog.py --json search "project:Project-A category:S3 resume"
-python scripts/bios_worklog.py --json validate
+python bios-worklog/scripts/bios_worklog.py --help
+python bios-worklog/scripts/bios_worklog.py --json status
+python bios-worklog/scripts/bios_worklog.py --json list --status investigating
+python bios-worklog/scripts/bios_worklog.py --json search "project:Project-A category:S3 resume"
+python bios-worklog/scripts/bios_worklog.py --json validate
 ```
 
 支持 Python 3.9 及以上版本，只使用标准库。
@@ -110,7 +122,7 @@ python scripts/bios_worklog.py --json validate
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s bios-worklog/tests -v
 ```
 
 ## 安全说明
