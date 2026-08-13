@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Portable Markdown knowledge-base manager for the bios-worklog Agent Skill.
 
-The script intentionally uses only the Python standard library. Markdown issue
-files are the source of truth; generated indexes and state can be rebuilt.
+The script intentionally uses only the Python standard library. Markdown work
+records are the source of truth; generated indexes and state can be rebuilt.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 KB_KIND = "bios-worklog-knowledge-base"
 # Keep machine-readable JSON usable when Windows inherits a legacy console code
 # page (for example CP936). This is a no-op on UTF-8 terminals.
@@ -33,28 +33,35 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-VALID_STATUSES = {"investigating", "paused", "verifying", "solved"}
+VALID_RECORD_TYPES = {"issue", "feature"}
+RECORD_TYPE_LABELS = {"issue": "问题", "feature": "功能"}
+VALID_STATUSES = {"investigating", "implementing", "paused", "verifying", "solved", "completed"}
 STATUS_LABELS = {
     "investigating": "调查中",
+    "implementing": "实现中",
     "paused": "已暂停",
     "verifying": "验证中",
     "solved": "已解决",
+    "completed": "已完成",
 }
+TERMINAL_STATUSES = {"solved", "completed"}
 VALID_CONFIDENCE = {"unknown", "hypothesis", "probable", "confirmed"}
 META_ORDER = [
     "id",
+    "type",
     "project",
     "title",
     "status",
     "created",
     "updated",
     "resolved",
+    "completed",
+    "reusable",
     "categories",
     "tags",
     "confidence",
 ]
 REQUIRED_META = {"id", "project", "title", "status", "created", "updated"}
-MARKER_NAMES = ("DESCRIPTION", "ENVIRONMENT", "REPRODUCTION", "CURRENT", "HISTORY", "FINAL", "RELATED")
 
 
 class WorklogError(RuntimeError):
@@ -258,6 +265,20 @@ def normalize_rel_link(path: Path) -> str:
     return path.as_posix().replace(" ", "%20")
 
 
+def record_type(metadata: Mapping[str, Any]) -> str:
+    """Return the record type, treating v1 records without `type` as issues."""
+    value = str(metadata.get("type") or "issue").casefold()
+    return value if value in VALID_RECORD_TYPES else value
+
+
+def is_terminal(metadata: Mapping[str, Any]) -> bool:
+    return str(metadata.get("status", "")) in TERMINAL_STATUSES
+
+
+def normalize_record_path(path: Path) -> str:
+    return path.as_posix()
+
+
 # ---------------------------------------------------------------------------
 # Restricted YAML front matter (top-level JSON scalars and scalar lists)
 # ---------------------------------------------------------------------------
@@ -371,7 +392,7 @@ def extract_marker(body: str, name: str) -> str:
     start_index = body.find(start)
     end_index = body.find(end)
     if start_index < 0 or end_index < 0 or end_index < start_index:
-        raise WorklogError(f"问题记录缺少受管理区域 {name}。请先运行 validate 检查文件。")
+        raise WorklogError(f"工作记录缺少受管理区域 {name}。请先运行 validate 检查文件。")
     return body[start_index + len(start) : end_index].strip()
 
 
@@ -381,7 +402,7 @@ def replace_marker(body: str, name: str, new_content: str) -> str:
     replacement = f"{start}\n{new_content.strip()}\n{end}"
     updated, count = pattern.subn(lambda _: replacement, body, count=1)
     if count != 1:
-        raise WorklogError(f"问题记录中的受管理区域 {name} 缺失或重复。")
+        raise WorklogError(f"工作记录中的受管理区域 {name} 缺失或重复。")
     return updated
 
 
@@ -476,6 +497,22 @@ def render_final(data: Mapping[str, Any]) -> str:
     return "\n\n".join(f"### {heading}\n\n{format_value(value, empty)}" for heading, value, empty in fields)
 
 
+def render_feature_final(data: Mapping[str, Any]) -> str:
+    fields = [
+        ("最终方案", coalesce(data, "final_design", "implementation", "solution"), "尚未完成。"),
+        ("设计决策与原因", coalesce(data, "design_decisions", "rationale", "principle"), "未记录。"),
+        ("修改内容", coalesce(data, "changed_files", "files_changed", "changes"), "未记录。"),
+        ("验证结果", coalesce(data, "validation", "verification"), "尚未验证。"),
+        ("可直接复用部分", coalesce(data, "reusable_parts", "reusable_components"), "尚未整理。"),
+        ("项目相关部分", coalesce(data, "project_specific", "project_specific_parts"), "尚未整理。"),
+        ("复用前提", coalesce(data, "prerequisites", "applicability"), "尚未整理。"),
+        ("参考实现步骤", coalesce(data, "reference_steps", "reuse_steps"), "尚未整理。"),
+        ("已知限制与风险", coalesce(data, "known_risks", "risks", "limitations"), "暂无已知限制。"),
+        ("可复用经验", coalesce(data, "reusable_lessons", "lessons"), "尚未总结。"),
+    ]
+    return "\n\n".join(f"### {heading}\n\n{format_value(value, empty)}" for heading, value, empty in fields)
+
+
 def render_related(value: Any) -> str:
     items = as_list(value)
     return "\n".join(f"- {item}" for item in items) if items else "暂无。"
@@ -545,6 +582,83 @@ def render_issue_body(issue_id: str, title: str, data: Mapping[str, Any]) -> str
 {related}
 {marker_end('RELATED')}
 """.strip()
+
+
+def render_feature_body(record_id: str, title: str, data: Mapping[str, Any]) -> str:
+    objective = coalesce(data, "objective", "description", "goal", default="待补充。")
+    background = coalesce(data, "background", "context", default="待补充。")
+    requirements = coalesce(data, "requirements", "requirements_and_constraints", "constraints", default=[])
+    design = coalesce(data, "design", "design_plan", "proposal", "solution_options", default="待补充。")
+    current = render_current_state(data)
+
+    initial = ensure_mapping(data.get("initial_checkpoint"), "initial_checkpoint") if data.get("initial_checkpoint") else {}
+    if not initial:
+        initial = {
+            "title": "创建功能记录",
+            "purpose": "建立功能方案与实现记录。",
+            "result": objective,
+            "findings": coalesce(data, "confirmed_facts", "facts"),
+            "impact": coalesce(data, "current_assessment", "assessment", "design_decision"),
+            "next_steps": coalesce(data, "next_steps"),
+        }
+    history = render_checkpoint(initial, default_title="创建功能记录", kind="创建")
+    final = render_feature_final({})
+    related = render_related(coalesce(data, "related_records", "related_issues", "related"))
+    return f"""# {record_id}：{sanitize_markdown(title)}
+
+## 功能目标
+
+{marker_start('DESCRIPTION')}
+{format_value(objective, '待补充。')}
+{marker_end('DESCRIPTION')}
+
+## 背景
+
+{marker_start('ENVIRONMENT')}
+{format_value(background, '待补充。')}
+{marker_end('ENVIRONMENT')}
+
+## 需求与约束
+
+{marker_start('REPRODUCTION')}
+{format_value(requirements)}
+{marker_end('REPRODUCTION')}
+
+## 方案设计
+
+{marker_start('DESIGN')}
+{format_value(design, '待补充。')}
+{marker_end('DESIGN')}
+
+## 当前状态
+
+{marker_start('CURRENT')}
+{current}
+{marker_end('CURRENT')}
+
+## 实施记录
+
+{marker_start('HISTORY')}
+{history}
+{marker_end('HISTORY')}
+
+## 最终成果与复用指南
+
+{marker_start('FINAL')}
+{final}
+{marker_end('FINAL')}
+
+## 相关记录
+
+{marker_start('RELATED')}
+{related}
+{marker_end('RELATED')}
+""".strip()
+
+
+def required_markers(metadata: Mapping[str, Any]) -> Tuple[str, ...]:
+    base = ("DESCRIPTION", "ENVIRONMENT", "REPRODUCTION", "CURRENT", "HISTORY", "FINAL", "RELATED")
+    return base + (("DESIGN",) if record_type(metadata) == "feature" else ())
 
 
 def extract_history_entries(history: str) -> List[str]:
@@ -622,7 +736,7 @@ class KnowledgeBase:
         try:
             text = path.read_text(encoding="utf-8-sig")
         except OSError as exc:
-            raise WorklogError(f"无法读取问题记录 {path}: {exc}") from exc
+            raise WorklogError(f"无法读取工作记录 {path}: {exc}") from exc
         metadata, body = parse_frontmatter(text, str(path))
         return Record(path=path, metadata=metadata, body=body, text=text)
 
@@ -631,7 +745,10 @@ class KnowledgeBase:
         errors: List[Dict[str, str]] = []
         if not self.projects_dir.exists():
             return records, errors
-        for path in sorted(self.projects_dir.glob("*/issues/*.md")):
+        paths = set(self.projects_dir.glob("*/records/*.md"))
+        # Backward compatibility with v1 knowledge bases.
+        paths.update(self.projects_dir.glob("*/issues/*.md"))
+        for path in sorted(paths):
             try:
                 records.append(self.read_record(path))
             except WorklogError as exc:
@@ -645,8 +762,8 @@ class KnowledgeBase:
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
-            raise WorklogError(f"检测到重复问题 ID：{issue_id}。请运行 validate。")
-        raise WorklogError(f"未找到问题：{issue_id}")
+            raise WorklogError(f"检测到重复记录 ID：{issue_id}。请运行 validate。")
+        raise WorklogError(f"未找到记录：{issue_id}")
 
     def load_state(self) -> Dict[str, Any]:
         raw = load_json(self.state_path, {"version": 1, "workspaces": {}})
@@ -710,13 +827,13 @@ class KnowledgeBase:
                 pass
         if allow_single_open:
             records, _ = self.scan_records()
-            open_records = [record for record in records if record.metadata.get("status") != "solved"]
+            open_records = [record for record in records if not is_terminal(record.metadata)]
             if len(open_records) == 1:
                 return open_records[0]
             if len(open_records) > 1:
                 choices = ", ".join(str(record.metadata.get("id")) for record in open_records[:8])
-                raise WorklogError(f"存在多个未解决问题，请指定 ID：{choices}")
-        raise WorklogError("当前工作区没有活动问题。请先 start 或 resume <ID>。")
+                raise WorklogError(f"存在多个未完成记录，请指定 ID：{choices}")
+        raise WorklogError("当前工作区没有活动记录。请先 start-issue、start-feature 或 resume <ID>。")
 
     def next_issue_id(self) -> str:
         prefix = datetime.now().astimezone().strftime("BIOS-%Y%m%d-")
@@ -742,7 +859,7 @@ class KnowledgeBase:
                 candidate = self.projects_dir / f"{slug}-{suffix}"
                 index_meta = candidate / ".project.json"
         candidate.mkdir(parents=True, exist_ok=True)
-        (candidate / "issues").mkdir(parents=True, exist_ok=True)
+        (candidate / "records").mkdir(parents=True, exist_ok=True)
         if not index_meta.exists():
             atomic_write_json(index_meta, {"name": project, "created": now_iso()})
         return candidate
@@ -750,55 +867,70 @@ class KnowledgeBase:
     def write_record(self, record: Record) -> None:
         atomic_write_text(record.path, compose_document(record.metadata, record.body))
 
-    def create_issue(self, project: str, title: str, data: Mapping[str, Any]) -> Dict[str, Any]:
+    def create_record(self, kind: str, project: str, title: str, data: Mapping[str, Any]) -> Dict[str, Any]:
+        kind = sanitize_markdown(kind).casefold()
+        if kind not in VALID_RECORD_TYPES:
+            raise WorklogError(f"记录类型无效：{kind}")
         project = sanitize_markdown(project)
         title = sanitize_markdown(title)
+        command = "start-issue" if kind == "issue" else "start-feature"
         if not project:
-            raise WorklogError("start 需要项目名称。")
+            raise WorklogError(f"{command} 需要项目名称。")
         if not title:
-            raise WorklogError("start 需要问题标题。")
+            raise WorklogError(f"{command} 需要记录标题。")
         self.assert_initialized()
         with self.write_lock():
             issue_id = self.next_issue_id()
             project_dir = self.project_directory(project)
-            filename = f"{issue_id}-{safe_slug(title, 'issue')}.md"
-            issue_path = project_dir / "issues" / filename
+            filename = f"{issue_id}-{safe_slug(title, 'record')}.md"
+            issue_path = project_dir / "records" / filename
             if issue_path.exists():
-                raise WorklogError(f"问题文件已存在：{issue_path}")
+                raise WorklogError(f"记录文件已存在：{issue_path}")
             timestamp = now_iso()
             categories = as_list(coalesce(data, "categories", "category"))
             tags = as_list(data.get("tags"))
             confidence = sanitize_markdown(data.get("confidence")) or "unknown"
             if confidence not in VALID_CONFIDENCE:
                 confidence = "unknown"
-            status = sanitize_markdown(data.get("status")) or "investigating"
-            if status not in VALID_STATUSES or status == "solved":
-                status = "investigating"
+            default_status = "investigating" if kind == "issue" else "implementing"
+            status = sanitize_markdown(data.get("status")) or default_status
+            if status not in VALID_STATUSES or status in TERMINAL_STATUSES:
+                status = default_status
             metadata: Dict[str, Any] = {
                 "id": issue_id,
+                "type": kind,
                 "project": project,
                 "title": title,
                 "status": status,
                 "created": timestamp,
                 "updated": timestamp,
+                "reusable": bool(data.get("reusable", kind == "feature")),
                 "categories": categories,
                 "tags": tags,
                 "confidence": confidence,
             }
-            body = render_issue_body(issue_id, title, data)
+            body = render_issue_body(issue_id, title, data) if kind == "issue" else render_feature_body(issue_id, title, data)
             record = Record(issue_path, metadata, body, compose_document(metadata, body))
             self.write_record(record)
             self.set_active(record)
             warnings = self.reindex_unlocked()
         return {
-            "message": "已创建 BIOS 问题记录。",
+            "message": f"已创建 BIOS {RECORD_TYPE_LABELS[kind]}记录。",
             "id": issue_id,
+            "type": kind,
             "project": project,
             "title": title,
             "status": status,
             "path": str(issue_path),
             "warnings": warnings,
         }
+
+    def create_issue(self, project: str, title: str, data: Mapping[str, Any]) -> Dict[str, Any]:
+        """Backward-compatible Python API for v1 callers."""
+        return self.create_record("issue", project, title, data)
+
+    def create_feature(self, project: str, title: str, data: Mapping[str, Any]) -> Dict[str, Any]:
+        return self.create_record("feature", project, title, data)
 
     def _apply_state_update(self, body: str, data: Mapping[str, Any]) -> str:
         existing = extract_marker(body, "CURRENT")
@@ -819,8 +951,9 @@ class KnowledgeBase:
         forced_status: Optional[str] = None,
     ) -> Record:
         status = str(record.metadata.get("status", "investigating"))
-        if status == "solved":
-            raise WorklogError("已解决的问题不能直接添加检查点；请先执行 reopen。")
+        if status in TERMINAL_STATUSES:
+            action = "reopen" if record_type(record.metadata) == "issue" else "新建功能记录"
+            raise WorklogError(f"已完成的记录不能直接添加检查点；请先执行 {action}。")
         checkpoint = render_checkpoint(data, default_title=default_title, kind=kind)
         body = append_marker(record.body, "HISTORY", checkpoint)
         body = self._apply_state_update(body, data)
@@ -829,11 +962,11 @@ class KnowledgeBase:
         metadata["updated"] = timestamp
         requested_status = forced_status or sanitize_markdown(data.get("status"))
         if requested_status:
-            if requested_status not in VALID_STATUSES or requested_status == "solved":
+            if requested_status not in VALID_STATUSES or requested_status in TERMINAL_STATUSES:
                 raise WorklogError(f"检查点状态无效：{requested_status}")
             metadata["status"] = requested_status
         elif status == "paused":
-            metadata["status"] = "investigating"
+            metadata["status"] = "investigating" if record_type(metadata) == "issue" else "implementing"
         for source_key, meta_key in (("categories", "categories"), ("category", "categories"), ("tags", "tags")):
             if source_key in data:
                 metadata[meta_key] = as_list(data[source_key])
@@ -851,10 +984,10 @@ class KnowledgeBase:
         self.assert_initialized()
         with self.write_lock():
             record = self.resolve_issue(issue_id)
-            updated = self._checkpoint_unlocked(record, data, "调查检查点", "检查点")
+            updated = self._checkpoint_unlocked(record, data, "工作检查点", "检查点")
             warnings = self.reindex_unlocked()
         return {
-            "message": "已把检查点追加到当前问题记录。",
+            "message": "已把检查点追加到当前工作记录。",
             "id": updated.metadata.get("id"),
             "status": updated.metadata.get("status"),
             "updated": updated.metadata.get("updated"),
@@ -865,11 +998,11 @@ class KnowledgeBase:
     def pause(self, issue_id: Optional[str], data: Mapping[str, Any]) -> Dict[str, Any]:
         self.assert_initialized()
         payload = dict(data)
-        payload.setdefault("title", "暂停调查")
-        payload.setdefault("result", "保存当前调查状态，等待后续恢复。")
+        payload.setdefault("title", "暂停工作")
+        payload.setdefault("result", "保存当前工作状态，等待后续恢复。")
         with self.write_lock():
             record = self.resolve_issue(issue_id)
-            updated = self._checkpoint_unlocked(record, payload, "暂停调查", "暂停", forced_status="paused")
+            updated = self._checkpoint_unlocked(record, payload, "暂停工作", "暂停", forced_status="paused")
             warnings = self.reindex_unlocked()
         return {
             "message": "已保存暂停检查点。",
@@ -884,23 +1017,41 @@ class KnowledgeBase:
         history = extract_marker(record.body, "HISTORY")
         entries = extract_history_entries(history)[-recent:]
         metadata = record.metadata
+        kind = record_type(metadata)
         categories = "、".join(as_list(metadata.get("categories"))) or "未分类"
+        label = RECORD_TYPE_LABELS.get(kind, kind)
+        if kind == "feature":
+            subject_sections = [
+                f"## 功能目标\n\n{extract_marker(record.body, 'DESCRIPTION')}",
+                f"## 背景\n\n{extract_marker(record.body, 'ENVIRONMENT')}",
+                f"## 需求与约束\n\n{extract_marker(record.body, 'REPRODUCTION')}",
+                f"## 方案设计\n\n{extract_marker(record.body, 'DESIGN')}",
+            ]
+            history_heading = "最近实施记录"
+            final_heading = "最终成果与复用指南"
+        else:
+            subject_sections = [
+                f"## 问题描述\n\n{extract_marker(record.body, 'DESCRIPTION')}",
+                f"## 环境\n\n{extract_marker(record.body, 'ENVIRONMENT')}",
+                f"## 复现步骤\n\n{extract_marker(record.body, 'REPRODUCTION')}",
+            ]
+            history_heading = "最近调查记录"
+            final_heading = "最终结论"
         parts = [
-            f"# 恢复问题 {metadata.get('id')}：{metadata.get('title')}",
+            f"# 恢复{label}记录 {metadata.get('id')}：{metadata.get('title')}",
             "## 记录信息\n\n"
+            f"- 类型：{label}\n"
             f"- 项目：{metadata.get('project')}\n"
             f"- 状态：{STATUS_LABELS.get(str(metadata.get('status')), metadata.get('status'))}\n"
             f"- 分类：{categories}\n"
             f"- 最后更新：{metadata.get('updated')}",
-            f"## 问题描述\n\n{extract_marker(record.body, 'DESCRIPTION')}",
-            f"## 环境\n\n{extract_marker(record.body, 'ENVIRONMENT')}",
-            f"## 复现步骤\n\n{extract_marker(record.body, 'REPRODUCTION')}",
+            *subject_sections,
             f"## 当前状态\n\n{extract_marker(record.body, 'CURRENT')}",
         ]
         if entries:
-            parts.append("## 最近调查记录\n\n" + "\n\n---\n\n".join(entries))
-        if metadata.get("status") == "solved":
-            parts.append(f"## 最终结论\n\n{extract_marker(record.body, 'FINAL')}")
+            parts.append(f"## {history_heading}\n\n" + "\n\n---\n\n".join(entries))
+        if is_terminal(metadata):
+            parts.append(f"## {final_heading}\n\n{extract_marker(record.body, 'FINAL')}")
         parts.append(f"## 原始记录\n\n`{record.path}`")
         return "\n\n".join(parts)
 
@@ -908,7 +1059,7 @@ class KnowledgeBase:
         self.assert_initialized()
         record = self.resolve_issue(issue_id)
         return {
-            "message": "已生成问题恢复上下文。",
+            "message": "已生成工作记录恢复上下文。",
             "id": record.metadata.get("id"),
             "metadata": record.metadata,
             "path": str(record.path),
@@ -919,20 +1070,22 @@ class KnowledgeBase:
         self.assert_initialized()
         with self.write_lock():
             record = self.resolve_issue(issue_id)
-            if record.metadata.get("status") == "solved":
-                raise WorklogError("该问题已解决。如需继续调查，请先执行 reopen。")
+            if is_terminal(record.metadata):
+                if record_type(record.metadata) == "issue":
+                    raise WorklogError("该问题已解决。如需继续调查，请先执行 reopen。")
+                raise WorklogError("该功能记录已完成。如需开展新的实现工作，请使用 start-feature 创建新记录并关联本记录。")
             metadata = dict(record.metadata)
             body = record.body
             if metadata.get("status") == "paused":
-                metadata["status"] = "investigating"
+                metadata["status"] = "investigating" if record_type(metadata) == "issue" else "implementing"
             metadata["updated"] = now_iso()
             if record_event:
                 event = render_checkpoint(
                     {
-                        "title": "恢复调查",
-                        "result": "在新的工作上下文中恢复该问题。",
+                        "title": "恢复工作",
+                        "result": "在新的工作上下文中恢复该记录。",
                     },
-                    default_title="恢复调查",
+                    default_title="恢复工作",
                     kind="恢复",
                 )
                 body = append_marker(body, "HISTORY", event)
@@ -942,7 +1095,7 @@ class KnowledgeBase:
             warnings = self.reindex_unlocked()
             context = self.build_context(updated, recent=recent)
         return {
-            "message": "已恢复问题并设为当前活动问题。",
+            "message": "已恢复工作记录并设为当前活动记录。",
             "id": updated.metadata.get("id"),
             "status": updated.metadata.get("status"),
             "path": str(updated.path),
@@ -960,7 +1113,9 @@ class KnowledgeBase:
             raise WorklogError("solve 缺少必填字段：" + ", ".join(missing))
         with self.write_lock():
             record = self.resolve_issue(issue_id)
-            if record.metadata.get("status") == "solved":
+            if record_type(record.metadata) != "issue":
+                raise WorklogError("solve 只用于问题记录；功能记录请使用 complete。")
+            if is_terminal(record.metadata):
                 raise WorklogError("该问题已经是 solved 状态。")
             body = replace_marker(record.body, "FINAL", render_final(data))
             if "related_issues" in data or "related" in data:
@@ -1011,12 +1166,85 @@ class KnowledgeBase:
             "warnings": warnings,
         }
 
+    def complete(self, issue_id: Optional[str], data: Mapping[str, Any]) -> Dict[str, Any]:
+        self.assert_initialized()
+        final_design = coalesce(data, "final_design", "implementation", "solution")
+        validation = coalesce(data, "validation", "verification")
+        reusable_parts = coalesce(data, "reusable_parts", "reusable_components")
+        missing = [
+            name
+            for name, value in (
+                ("final_design", final_design),
+                ("validation", validation),
+                ("reusable_parts", reusable_parts),
+            )
+            if not value
+        ]
+        if missing:
+            raise WorklogError("complete 缺少必填字段：" + ", ".join(missing))
+        with self.write_lock():
+            record = self.resolve_issue(issue_id)
+            if record_type(record.metadata) != "feature":
+                raise WorklogError("complete 只用于功能记录；问题记录请使用 solve。")
+            if is_terminal(record.metadata):
+                raise WorklogError("该功能记录已经是 completed 状态。")
+            body = replace_marker(record.body, "FINAL", render_feature_final(data))
+            if "related_records" in data or "related_issues" in data or "related" in data:
+                body = replace_marker(
+                    body,
+                    "RELATED",
+                    render_related(coalesce(data, "related_records", "related_issues", "related")),
+                )
+            closing_data = {
+                "title": sanitize_markdown(data.get("checkpoint_title")) or "功能完成",
+                "purpose": "记录最终方案、验证结果和跨项目复用信息。",
+                "result": final_design,
+                "findings": reusable_parts,
+                "evidence": validation,
+                "impact": coalesce(data, "reusable_lessons", "lessons"),
+                "next_steps": coalesce(data, "follow_up", "next_steps"),
+            }
+            body = append_marker(body, "HISTORY", render_checkpoint(closing_data, "功能完成", "完成"))
+            state_payload: Dict[str, Any] = {
+                "current_state": {
+                    "current_assessment": "功能实现和验证已完成。",
+                    "unknowns": as_list(coalesce(data, "known_risks", "risks", "limitations")),
+                    "next_steps": coalesce(data, "follow_up", "next_steps", default=[]),
+                }
+            }
+            if data.get("current_state") is not None:
+                state_payload["current_state"] = data["current_state"]
+            body = self._apply_state_update(body, state_payload)
+            metadata = dict(record.metadata)
+            timestamp = now_iso()
+            metadata.update(
+                {
+                    "status": "completed",
+                    "reusable": bool(data.get("reusable", True)),
+                    "updated": timestamp,
+                    "completed": timestamp,
+                }
+            )
+            updated = Record(record.path, metadata, body, compose_document(metadata, body))
+            self.write_record(updated)
+            self.clear_active(str(metadata.get("id")))
+            warnings = self.reindex_unlocked()
+        return {
+            "message": "功能记录已完成并标记为 completed。",
+            "id": updated.metadata.get("id"),
+            "type": "feature",
+            "status": "completed",
+            "completed": updated.metadata.get("completed"),
+            "path": str(updated.path),
+            "warnings": warnings,
+        }
+
     def reopen(self, issue_id: Optional[str], data: Mapping[str, Any]) -> Dict[str, Any]:
         self.assert_initialized()
         with self.write_lock():
             record = self.resolve_issue(issue_id, allow_single_open=False)
-            if record.metadata.get("status") != "solved":
-                raise WorklogError("reopen 只能用于已解决的问题。")
+            if record_type(record.metadata) != "issue" or record.metadata.get("status") != "solved":
+                raise WorklogError("reopen 只能用于已解决的问题记录。")
             payload = dict(data)
             payload.setdefault("title", "重新打开问题")
             payload.setdefault("result", coalesce(data, "reason", default="问题再次出现，需要继续调查。"))
@@ -1043,7 +1271,12 @@ class KnowledgeBase:
             "warnings": warnings,
         }
 
-    def list_records(self, project: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
+    def list_records(
+        self,
+        project: Optional[str] = None,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
         self.assert_initialized()
         records, errors = self.scan_records()
         filtered = []
@@ -1053,18 +1286,24 @@ class KnowledgeBase:
                 continue
             if status and str(meta.get("status", "")).casefold() != status.casefold():
                 continue
+            if kind and record_type(meta) != kind.casefold():
+                continue
             filtered.append(self.summary(record))
         filtered.sort(key=lambda item: str(item.get("updated", "")), reverse=True)
         return {
-            "message": f"找到 {len(filtered)} 条问题记录。",
+            "message": f"找到 {len(filtered)} 条工作记录。",
             "count": len(filtered),
-            "issues": filtered,
+            "records": filtered,
+            "issues": filtered,  # Backward-compatible response key.
             "errors": errors,
         }
 
     def summary(self, record: Record) -> Dict[str, Any]:
+        kind = record_type(record.metadata)
         return {
             "id": record.metadata.get("id"),
+            "type": kind,
+            "typeLabel": RECORD_TYPE_LABELS.get(kind, kind),
             "project": record.metadata.get("project"),
             "title": record.metadata.get("title"),
             "status": record.metadata.get("status"),
@@ -1077,7 +1316,7 @@ class KnowledgeBase:
 
     def search(self, query: str, project: Optional[str], status: Optional[str], limit: int) -> Dict[str, Any]:
         self.assert_initialized()
-        query_project, query_status, query_category, query_tag, terms = self._parse_search_query(query)
+        query_project, query_status, query_category, query_tag, query_type, terms = self._parse_search_query(query)
         project = project or query_project
         status = status or query_status
         records, errors = self.scan_records()
@@ -1088,6 +1327,8 @@ class KnowledgeBase:
                 continue
             if status and str(meta.get("status", "")).casefold() != status.casefold():
                 continue
+            if query_type and record_type(meta) != query_type.casefold():
+                continue
             categories = as_list(meta.get("categories"))
             tags = as_list(meta.get("tags"))
             if query_category and not any(query_category.casefold() in item.casefold() for item in categories):
@@ -1095,7 +1336,15 @@ class KnowledgeBase:
             if query_tag and not any(query_tag.casefold() in item.casefold() for item in tags):
                 continue
             title_blob = " ".join(
-                [str(meta.get("id", "")), str(meta.get("title", "")), str(meta.get("project", "")), " ".join(categories), " ".join(tags)]
+                [
+                    str(meta.get("id", "")),
+                    record_type(meta),
+                    RECORD_TYPE_LABELS.get(record_type(meta), ""),
+                    str(meta.get("title", "")),
+                    str(meta.get("project", "")),
+                    " ".join(categories),
+                    " ".join(tags),
+                ]
             ).casefold()
             body_blob = record.body.casefold()
             score = 0
@@ -1122,15 +1371,18 @@ class KnowledgeBase:
             item.update({"score": score, "matched": sorted(set(reasons))})
             results.append(item)
         return {
-            "message": f"搜索到 {len(results)} 条相关问题。",
+            "message": f"搜索到 {len(results)} 条相关工作记录。",
             "query": query,
             "count": len(results),
-            "issues": results,
+            "records": results,
+            "issues": results,  # Backward-compatible response key.
             "errors": errors,
         }
 
     @staticmethod
-    def _parse_search_query(query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], List[str]]:
+    def _parse_search_query(
+        query: str,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], List[str]]:
         try:
             tokens = shlex.split(query)
         except ValueError:
@@ -1140,11 +1392,18 @@ class KnowledgeBase:
         for token in tokens:
             if ":" in token:
                 key, value = token.split(":", 1)
-                if key.casefold() in {"project", "status", "category", "tag"} and value:
+                if key.casefold() in {"project", "status", "category", "tag", "type"} and value:
                     filters[key.casefold()] = value
                     continue
             terms.append(token)
-        return filters.get("project"), filters.get("status"), filters.get("category"), filters.get("tag"), terms
+        return (
+            filters.get("project"),
+            filters.get("status"),
+            filters.get("category"),
+            filters.get("tag"),
+            filters.get("type"),
+            terms,
+        )
 
     def status(self, issue_id: Optional[str]) -> Dict[str, Any]:
         self.assert_initialized()
@@ -1155,7 +1414,7 @@ class KnowledgeBase:
                 raise
             config = self.config()
             return {
-                "message": "当前工作区没有活动问题。",
+                "message": "当前工作区没有活动记录。",
                 "active": False,
                 "workspace": self.workspace,
                 "reminderMinutes": int(config.get("reminderMinutes", 45)),
@@ -1164,11 +1423,11 @@ class KnowledgeBase:
         config = self.config()
         reminder = int(config.get("reminderMinutes", 45))
         elapsed = minutes_since(record.metadata.get("updated"))
-        recommended = bool(record.metadata.get("status") != "solved" and elapsed is not None and elapsed >= reminder)
+        recommended = bool(not is_terminal(record.metadata) and elapsed is not None and elapsed >= reminder)
         result = self.summary(record)
         result.update(
             {
-                "message": "已读取当前问题状态。",
+                "message": "已读取当前工作记录状态。",
                 "active": True,
                 "workspace": self.workspace,
                 "minutesSinceCheckpoint": elapsed,
@@ -1194,9 +1453,16 @@ class KnowledgeBase:
                     issues.append({"path": str(record.path), "error": f"重复 ID；首次出现于 {seen[folded]}"})
                 else:
                     seen[folded] = str(record.path)
+            kind = record_type(meta)
+            if kind not in VALID_RECORD_TYPES:
+                issues.append({"path": str(record.path), "error": f"无效 type：{kind}"})
             if meta.get("status") not in VALID_STATUSES:
                 issues.append({"path": str(record.path), "error": f"无效 status：{meta.get('status')}"})
-            for marker in MARKER_NAMES:
+            elif kind == "issue" and meta.get("status") in {"implementing", "completed"}:
+                issues.append({"path": str(record.path), "error": f"issue 不支持 status：{meta.get('status')}"})
+            elif kind == "feature" and meta.get("status") in {"investigating", "solved"}:
+                issues.append({"path": str(record.path), "error": f"feature 不支持 status：{meta.get('status')}"})
+            for marker in required_markers(meta):
                 start_count = record.body.count(marker_start(marker))
                 end_count = record.body.count(marker_end(marker))
                 if start_count != 1 or end_count != 1:
@@ -1238,35 +1504,35 @@ class KnowledgeBase:
             by_project.setdefault(str(record.metadata.get("project", "未分类项目")), []).append(record)
 
         root_lines = [
-            "# BIOS 问题总目录",
+            "# BIOS 工作记录总目录",
             "",
-            "> 本文件由 `bios-worklog` 自动生成。问题 Markdown 是唯一真实来源，请勿手工维护本表。",
+            "> 本文件由 `bios-worklog` 自动生成。记录 Markdown 是唯一真实来源，请勿手工维护本表。",
             "",
             f"最后生成：{display_time()}",
             "",
             "## 项目概览",
             "",
-            "| 项目 | 调查中/暂停/验证中 | 已解决 | 总数 | 项目目录 |",
+            "| 项目 | 进行中/暂停/验证中 | 已解决/已完成 | 总数 | 项目目录 |",
             "|---|---:|---:|---:|---|",
         ]
         for project in sorted(by_project, key=str.casefold):
             project_records = by_project[project]
-            solved = sum(1 for record in project_records if record.metadata.get("status") == "solved")
-            open_count = len(project_records) - solved
+            terminal = sum(1 for record in project_records if is_terminal(record.metadata))
+            open_count = len(project_records) - terminal
             project_dir = project_records[0].path.parent.parent
             project_index = project_dir / "INDEX.md"
             link = normalize_rel_link(project_index.relative_to(self.root))
             root_lines.append(
-                f"| {markdown_cell(project)} | {open_count} | {solved} | {len(project_records)} | [查看]({link}) |"
+                f"| {markdown_cell(project)} | {open_count} | {terminal} | {len(project_records)} | [查看]({link}) |"
             )
 
         root_lines.extend(
             [
                 "",
-                "## 全部问题",
+                "## 全部记录",
                 "",
-                "| ID | 项目 | 问题 | 状态 | 分类 | 更新时间 |",
-                "|---|---|---|---|---|---|",
+                "| ID | 类型 | 项目 | 标题 | 状态 | 可复用 | 分类 | 更新时间 |",
+                "|---|---|---|---|---|---|---|---|",
             ]
         )
         for record in records:
@@ -1274,41 +1540,45 @@ class KnowledgeBase:
             link = normalize_rel_link(record.path.relative_to(self.root))
             categories = "、".join(as_list(meta.get("categories"))) or "—"
             root_lines.append(
-                "| {id} | {project} | [{title}]({link}) | {status} | {categories} | {updated} |".format(
+                "| {id} | {type} | {project} | [{title}]({link}) | {status} | {reusable} | {categories} | {updated} |".format(
                     id=markdown_cell(meta.get("id")),
+                    type=markdown_cell(RECORD_TYPE_LABELS.get(record_type(meta), record_type(meta))),
                     project=markdown_cell(meta.get("project")),
                     title=markdown_cell(meta.get("title")),
                     link=link,
                     status=markdown_cell(STATUS_LABELS.get(str(meta.get("status")), meta.get("status"))),
+                    reusable="是" if meta.get("reusable") else "—",
                     categories=markdown_cell(categories),
                     updated=markdown_cell(meta.get("updated")),
                 )
             )
         if not records:
-            root_lines.append("| — | — | 尚无问题记录 | — | — | — |")
+            root_lines.append("| — | — | — | 尚无工作记录 | — | — | — | — |")
         atomic_write_text(self.root / "INDEX.md", "\n".join(root_lines))
 
         for project, project_records in by_project.items():
             project_records.sort(key=lambda record: str(record.metadata.get("updated", "")), reverse=True)
             project_dir = project_records[0].path.parent.parent
             lines = [
-                f"# {project} — 问题目录",
+                f"# {project} — 工作记录目录",
                 "",
                 "> 本文件由 `bios-worklog` 自动生成。",
                 "",
-                "| ID | 问题 | 状态 | 分类 | 更新时间 |",
-                "|---|---|---|---|---|",
+                "| ID | 类型 | 标题 | 状态 | 可复用 | 分类 | 更新时间 |",
+                "|---|---|---|---|---|---|---|",
             ]
             for record in project_records:
                 meta = record.metadata
                 link = normalize_rel_link(record.path.relative_to(project_dir))
                 categories = "、".join(as_list(meta.get("categories"))) or "—"
                 lines.append(
-                    "| {id} | [{title}]({link}) | {status} | {categories} | {updated} |".format(
+                    "| {id} | {type} | [{title}]({link}) | {status} | {reusable} | {categories} | {updated} |".format(
                         id=markdown_cell(meta.get("id")),
+                        type=markdown_cell(RECORD_TYPE_LABELS.get(record_type(meta), record_type(meta))),
                         title=markdown_cell(meta.get("title")),
                         link=link,
                         status=markdown_cell(STATUS_LABELS.get(str(meta.get("status")), meta.get("status"))),
+                        reusable="是" if meta.get("reusable") else "—",
                         categories=markdown_cell(categories),
                         updated=markdown_cell(meta.get("updated")),
                     )
@@ -1383,12 +1653,12 @@ def initialize(root: Path, set_default: bool, reminder_minutes: int) -> Dict[str
 
 本目录由 `bios-worklog` Agent Skill 管理。
 
-- `projects/<项目>/issues/`：每个 BIOS 问题对应一个 Markdown 文件。
+- `projects/<项目>/records/`：每个 BIOS 问题或功能对应一个 Markdown 文件。
 - `INDEX.md`：自动生成的顶层目录。
 - `projects/<项目>/INDEX.md`：自动生成的项目目录。
 - `.bios-worklog/`：配置和当前活动问题状态。
 
-问题 Markdown 是唯一真实来源。可以人工阅读和补充正文，但不要删除
+工作记录 Markdown 是唯一真实来源。可以人工阅读和补充正文，但不要删除
 `BIOS-WORKLOG` HTML 标记；目录文件应通过 `reindex` 重建。
 """,
         )
@@ -1440,7 +1710,7 @@ def configure(kb: KnowledgeBase, reminder_minutes: Optional[int], set_default: b
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bios_worklog.py",
-        description="Manage a portable Markdown knowledge base for BIOS debugging issues.",
+        description="Manage a portable Markdown knowledge base for BIOS debugging issues and feature implementations.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--root", help="知识库根目录；优先于环境变量和用户配置。")
@@ -1456,12 +1726,16 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--reminder-minutes", type=int)
     config_parser.add_argument("--set-default", action="store_true", help="把当前知识库设为用户默认。")
 
-    start_parser = subparsers.add_parser("start", help="创建问题记录并设为当前活动问题。")
-    start_parser.add_argument("--project", help="项目名称；也可放在输入 JSON 中。")
-    start_parser.add_argument("--title", help="问题标题；也可放在输入 JSON 中。")
-    start_parser.add_argument("--input", help="UTF-8 JSON 文件，或 - 表示 stdin。")
+    def add_start_parser(name: str, help_text: str) -> None:
+        start_parser = subparsers.add_parser(name, help=help_text)
+        start_parser.add_argument("--project", help="项目名称；也可放在输入 JSON 中。")
+        start_parser.add_argument("--title", help="记录标题；也可放在输入 JSON 中。")
+        start_parser.add_argument("--input", help="UTF-8 JSON 文件，或 - 表示 stdin。")
 
-    checkpoint_parser = subparsers.add_parser("checkpoint", help="向当前问题追加调查检查点。")
+    add_start_parser("start-issue", "创建问题调查记录并设为当前活动记录。")
+    add_start_parser("start-feature", "创建功能方案/实现记录并设为当前活动记录。")
+
+    checkpoint_parser = subparsers.add_parser("checkpoint", help="向当前记录追加工作检查点。")
     checkpoint_parser.add_argument("--id", dest="issue_id")
     checkpoint_parser.add_argument("--input", help="检查点 JSON 文件，或 - 表示 stdin。")
     checkpoint_parser.add_argument("--title")
@@ -1471,39 +1745,44 @@ def build_parser() -> argparse.ArgumentParser:
     pause_parser.add_argument("--id", dest="issue_id")
     pause_parser.add_argument("--input", help="暂停检查点 JSON 文件，或 - 表示 stdin。")
 
-    resume_parser = subparsers.add_parser("resume", help="恢复问题、设为活动问题并输出上下文。")
+    resume_parser = subparsers.add_parser("resume", help="恢复记录、设为活动记录并输出上下文。")
     resume_parser.add_argument("issue_id", nargs="?")
     resume_parser.add_argument("--recent", type=int, default=3)
     resume_parser.add_argument("--no-record", action="store_true", help="不追加恢复事件。")
 
-    context_parser = subparsers.add_parser("context", help="只读输出问题恢复上下文。")
+    context_parser = subparsers.add_parser("context", help="只读输出工作记录恢复上下文。")
     context_parser.add_argument("issue_id", nargs="?")
     context_parser.add_argument("--recent", type=int, default=3)
 
-    solve_parser = subparsers.add_parser("solve", help="填写最终结论并结案。")
+    solve_parser = subparsers.add_parser("solve", help="填写问题最终结论并结案。")
     solve_parser.add_argument("--id", dest="issue_id")
     solve_parser.add_argument("--input", required=True, help="结案 JSON 文件，或 - 表示 stdin。")
 
-    reopen_parser = subparsers.add_parser("reopen", help="重新打开已解决问题。")
+    complete_parser = subparsers.add_parser("complete", help="填写功能最终成果与复用指南并完成。")
+    complete_parser.add_argument("--id", dest="issue_id")
+    complete_parser.add_argument("--input", required=True, help="完成功能 JSON 文件，或 - 表示 stdin。")
+
+    reopen_parser = subparsers.add_parser("reopen", help="重新打开已解决的问题记录。")
     reopen_parser.add_argument("issue_id")
     reopen_parser.add_argument("--input", help="重新打开检查点 JSON 文件，或 - 表示 stdin。")
     reopen_parser.add_argument("--reason")
 
-    status_parser = subparsers.add_parser("status", help="查看当前问题和检查点提醒状态。")
+    status_parser = subparsers.add_parser("status", help="查看当前工作记录和检查点提醒状态。")
     status_parser.add_argument("--id", dest="issue_id")
 
-    list_parser = subparsers.add_parser("list", help="列出问题记录。")
+    list_parser = subparsers.add_parser("list", help="列出工作记录。")
     list_parser.add_argument("--project")
     list_parser.add_argument("--status", choices=sorted(VALID_STATUSES))
+    list_parser.add_argument("--type", dest="record_type", choices=sorted(VALID_RECORD_TYPES))
 
-    search_parser = subparsers.add_parser("search", help="搜索历史问题。")
-    search_parser.add_argument("query", nargs="*", help="关键词；支持 project:/status:/category:/tag:。")
+    search_parser = subparsers.add_parser("search", help="搜索历史工作记录。")
+    search_parser.add_argument("query", nargs="*", help="关键词；支持 type:/project:/status:/category:/tag:。")
     search_parser.add_argument("--project")
     search_parser.add_argument("--status", choices=sorted(VALID_STATUSES))
     search_parser.add_argument("--limit", type=int, default=20)
 
     subparsers.add_parser("reindex", help="重建总目录和项目目录。")
-    subparsers.add_parser("validate", help="校验问题记录结构。")
+    subparsers.add_parser("validate", help="校验工作记录结构。")
     subparsers.add_parser("doctor", help="显示知识库路径、配置和运行环境。")
     return parser
 
@@ -1525,17 +1804,18 @@ def emit_text(result: Mapping[str, Any]) -> None:
         print()
         print(result["context"])
         return
-    issues = result.get("issues")
-    if isinstance(issues, list) and issues and isinstance(issues[0], dict) and "id" in issues[0]:
+    records = result.get("records") or result.get("issues")
+    if isinstance(records, list) and records and isinstance(records[0], dict) and "id" in records[0]:
         print()
-        print("ID | 状态 | 项目 | 标题 | 更新时间")
-        print("---|---|---|---|---")
-        for issue in issues:
+        print("ID | 类型 | 状态 | 项目 | 标题 | 更新时间")
+        print("---|---|---|---|---|---")
+        for issue in records:
             print(
-                f"{issue.get('id')} | {issue.get('statusLabel', issue.get('status'))} | "
+                f"{issue.get('id')} | {issue.get('typeLabel', issue.get('type'))} | "
+                f"{issue.get('statusLabel', issue.get('status'))} | "
                 f"{issue.get('project')} | {issue.get('title')} | {issue.get('updated')}"
             )
-    for key in ("id", "project", "title", "status", "updated", "resolved", "path", "root"):
+    for key in ("id", "type", "project", "title", "status", "updated", "resolved", "completed", "path", "root"):
         if key in result and result[key] is not None:
             print(f"{key}: {result[key]}")
     if result.get("checkpointRecommended"):
@@ -1566,11 +1846,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             kb = KnowledgeBase(root, workspace=args.workspace)
             if args.command == "configure":
                 result = configure(kb, args.reminder_minutes, args.set_default)
-            elif args.command == "start":
+            elif args.command in {"start-issue", "start-feature"}:
                 payload = load_json_file(args.input)
                 project = args.project or sanitize_markdown(payload.pop("project", ""))
                 title = args.title or sanitize_markdown(payload.pop("title", ""))
-                result = kb.create_issue(project, title, payload)
+                kind = "issue" if args.command == "start-issue" else "feature"
+                result = kb.create_record(kind, project, title, payload)
             elif args.command == "checkpoint":
                 payload = load_json_file(args.input)
                 if args.title:
@@ -1586,6 +1867,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result = kb.context(args.issue_id, args.recent)
             elif args.command == "solve":
                 result = kb.solve(args.issue_id, load_json_file(args.input))
+            elif args.command == "complete":
+                result = kb.complete(args.issue_id, load_json_file(args.input))
             elif args.command == "reopen":
                 payload = load_json_file(args.input)
                 if args.reason:
@@ -1594,7 +1877,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif args.command == "status":
                 result = kb.status(args.issue_id)
             elif args.command == "list":
-                result = kb.list_records(args.project, args.status)
+                result = kb.list_records(args.project, args.status, args.record_type)
             elif args.command == "search":
                 result = kb.search(" ".join(args.query), args.project, args.status, args.limit)
             elif args.command == "reindex":

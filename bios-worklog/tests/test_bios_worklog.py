@@ -64,6 +64,28 @@ class BiosWorklogTests(unittest.TestCase):
             },
         )
 
+    def start_feature(self):
+        return self.kb.create_feature(
+            "Project-A",
+            "实现 BIOS Event Log 导出",
+            {
+                "objective": "在 BIOS Setup 中把 Event Log 导出到 USB。",
+                "background": "现有日志只能逐项查看，不便于跨团队分析。",
+                "requirements": ["支持 FAT32", "输出 UTF-8", "不阻塞 Setup"],
+                "design": {
+                    "selected": "独立 Export Protocol + 项目数据适配层",
+                    "reason": "隔离通用文件写入与项目数据源",
+                },
+                "confirmed_facts": ["各项目 Event Log 数据结构不同"],
+                "current_assessment": "公共导出模块应与 HII Callback 解耦。",
+                "unknowns": ["多分区 USB 的选择策略"],
+                "next_steps": ["定义 Protocol", "验证 Simple File System 枚举"],
+                "categories": ["Setup", "Logging"],
+                "tags": ["HII", "USB"],
+                "reusable": True,
+            },
+        )
+
     def test_init_creates_portable_layout_and_default_config(self):
         self.assertTrue((self.root / ".bios-worklog" / "config.json").exists())
         self.assertTrue((self.root / ".bios-worklog" / "state.json").exists())
@@ -77,7 +99,7 @@ class BiosWorklogTests(unittest.TestCase):
         result = self.start_issue()
         issue_path = Path(result["path"])
         self.assertTrue(issue_path.exists())
-        self.assertEqual(len(list(self.root.glob("projects/*/issues/*.md"))), 1)
+        self.assertEqual(len(list(self.root.glob("projects/*/records/*.md"))), 1)
         text = issue_path.read_text(encoding="utf-8")
         self.assertIn("status: \"investigating\"", text)
         self.assertIn("<!-- BIOS-WORKLOG:HISTORY:START -->", text)
@@ -133,8 +155,8 @@ class BiosWorklogTests(unittest.TestCase):
         self.assertEqual(resumed["status"], "investigating")
         self.assertEqual(Path(resumed["path"]), issue_path)
         self.assertIn("恢复后刷写测试 BIOS", resumed["context"])
-        self.assertIn("恢复调查", issue_path.read_text(encoding="utf-8"))
-        self.assertEqual(len(list(self.root.glob("projects/*/issues/*.md"))), 1)
+        self.assertIn("恢复工作", issue_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(list(self.root.glob("projects/*/records/*.md"))), 1)
 
     def test_solve_reopen_and_validation(self):
         started = self.start_issue()
@@ -199,6 +221,92 @@ class BiosWorklogTests(unittest.TestCase):
         self.assertIn("&lt;!-- BIOS-WORKLOG:HISTORY:END -->", text)
         self.assertTrue(self.kb.validate()["valid"])
 
+    def test_feature_lifecycle_uses_same_record_and_complete(self):
+        started = self.start_feature()
+        path = Path(started["path"])
+        self.assertEqual(started["type"], "feature")
+        self.assertEqual(started["status"], "implementing")
+        self.assertIn("records", path.parts)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn('type: "feature"', text)
+        self.assertIn("## 方案设计", text)
+        self.assertIn("BIOS-WORKLOG:DESIGN:START", text)
+
+        checkpoint = self.kb.checkpoint(
+            None,
+            {
+                "title": "完成文件系统枚举",
+                "actions": ["枚举 Simple File System Protocol"],
+                "result": "FAT32 USB 可以写入。",
+                "findings": ["不能假设第一个文件系统就是 USB"],
+                "current_assessment": "需要按设备路径筛选 Handle。",
+                "next_steps": ["实现设备路径筛选"],
+            },
+        )
+        self.assertEqual(checkpoint["path"], str(path))
+        completed = self.kb.complete(
+            None,
+            {
+                "final_design": "使用独立 Export Protocol，项目适配层提供数据。",
+                "design_decisions": ["Setup Callback 只发起请求"],
+                "changed_files": ["Common/EventLogExport/"],
+                "validation": ["5 种 FAT32 USB 通过", "5000 条日志通过"],
+                "reusable_parts": ["文件系统枚举", "UTF-8 格式化"],
+                "project_specific": ["Event Log 数据适配器", "HII Form ID"],
+                "prerequisites": ["DXE 可用 Simple File System Protocol"],
+                "reference_steps": ["引入公共模块", "实现项目适配器", "完成异常场景验证"],
+                "known_risks": ["安全策略可能禁止外部写入"],
+            },
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(Path(completed["path"]), path)
+        completed_text = path.read_text(encoding="utf-8")
+        self.assertIn("可直接复用部分", completed_text)
+        self.assertIn("5 种 FAT32 USB 通过", completed_text)
+        self.assertEqual(len(list(self.root.glob("projects/*/records/*.md"))), 1)
+        context = self.kb.context(started["id"], recent=2)["context"]
+        self.assertIn("功能目标", context)
+        self.assertIn("最终成果与复用指南", context)
+        self.assertTrue(self.kb.validate()["valid"])
+
+    def test_solve_and_complete_enforce_record_type(self):
+        issue = self.start_issue()
+        with self.assertRaises(bios_worklog.WorklogError):
+            self.kb.complete(
+                issue["id"],
+                {"final_design": "x", "validation": ["y"], "reusable_parts": ["z"]},
+            )
+        self.kb.clear_active(issue["id"])
+        feature = self.start_feature()
+        with self.assertRaises(bios_worklog.WorklogError):
+            self.kb.solve(
+                feature["id"],
+                {"root_cause": "x", "solution": "y", "validation": ["z"]},
+            )
+
+    def test_legacy_issue_directory_remains_readable(self):
+        started = self.start_issue()
+        current = Path(started["path"])
+        legacy_dir = current.parent.parent / "issues"
+        legacy_dir.mkdir()
+        legacy_path = legacy_dir / current.name
+        current.replace(legacy_path)
+        text = legacy_path.read_text(encoding="utf-8").replace('type: "issue"\n', "")
+        legacy_path.write_text(text, encoding="utf-8")
+        found = self.kb.find_issue(started["id"])
+        self.assertEqual(found.path, legacy_path)
+        self.assertEqual(bios_worklog.record_type(found.metadata), "issue")
+        self.assertTrue(self.kb.validate()["valid"])
+
+    def test_search_can_filter_feature_type(self):
+        feature = self.start_feature()
+        result = self.kb.search("type:feature Event Log", None, None, 20)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["records"][0]["id"], feature["id"])
+        self.assertEqual(result["records"][0]["type"], "feature")
+        issue_only = self.kb.search("type:issue Event Log", None, None, 20)
+        self.assertEqual(issue_only["count"], 0)
+
     def test_search_filters_and_keyword_matching(self):
         first = self.start_issue()
         self.kb.checkpoint(
@@ -248,7 +356,7 @@ class BiosWorklogTests(unittest.TestCase):
                     str(other_root),
                     "--workspace",
                     str(self.workspace),
-                    "start",
+                    "start-issue",
                     "--input",
                     str(input_path),
                 ]
