@@ -1,6 +1,6 @@
 # BIOS Worklog Agent Skill
 
-一个用于记录、恢复和检索 BIOS **问题调查**与**功能实现方案**的可移植 [Agent Skill](https://agentskills.io/)。
+一个用于记录、恢复和检索 BIOS **问题调查**与**功能实现方案**的可移植 [Agent Skill](https://agentskills.io/)，同时作为 Pi Package 提供可自动注册的快捷命令。
 
 每个工作项始终对应同一个 Markdown 文件：
 
@@ -14,16 +14,21 @@
 
 用户触发两个 start 动作时不需要在命令后写完整描述，Agent 会优先从当前会话提取项目、标题和内容。
 
-Skill 使用 Python 标准库脚本执行确定性文件操作，不依赖 Pi Extension，也不需要第三方 Python 包。
+Skill 使用 Python 标准库脚本执行确定性文件操作，不依赖 Pi Extension，也不需要第三方 Python 包。Pi 快捷命令通过 Prompt Templates 注册；其他兼容 Agent Skills 的工具仍可只安装 Skill 本体。
 
 ## 仓库结构
 
 ```text
 repository-root/
+├── package.json                  # Pi Package 清单
 ├── README.md
 ├── LICENSE
 ├── .gitignore
-└── bios-worklog/                 # 可直接复制安装的 Skill 目录
+├── prompts/                      # Pi 快捷命令（/bios-*）
+│   ├── bios-issue.md
+│   ├── bios-feature.md
+│   └── ...
+└── bios-worklog/                 # 可单独复制的标准 Agent Skill
     ├── SKILL.md
     ├── scripts/
     │   └── bios_worklog.py
@@ -37,17 +42,36 @@ repository-root/
 
 ## 安装
 
-下载或克隆后，只复制内层 **`bios-worklog/`** 到 Agent 的 Skills 目录。例如 Pi：
+### Pi（推荐，自动注册快捷命令）
+
+直接把本仓库安装为 Pi Package：
+
+```bash
+pi install git:github.com/MaShouo/bios-worklog
+```
+
+重启 Pi 或开启新会话后，将同时加载：
+
+- `bios-worklog` Skill，对应 `/skill:bios-worklog`；
+- `prompts/` 中的 `/bios-*` 快捷命令。
+
+Pi 默认启用 Skill 命令。如果 `/skill:bios-worklog` 没有出现在补全列表，请在 `/settings` 中启用 **Skill commands**，或在 `~/.pi/agent/settings.json` 中设置：
+
+```json
+{
+  "enableSkillCommands": true
+}
+```
+
+### 手工安装或其他 Agent Harness
+
+只需要标准 Skill 时，克隆仓库后把内层 **`bios-worklog/`** 复制到 Agent 的 Skills 目录。例如 Pi：
 
 ```text
 <本仓库>/bios-worklog/  →  ~/.pi/agent/skills/bios-worklog/
 ```
 
-```bash
-git clone https://github.com/MaShouo/bios-worklog.git
-```
-
-随后重新加载 Skills 或重启 Agent。仓库根目录的文件不需要复制。
+这种安装方式只注册 `/skill:bios-worklog`，不会自动安装独立的 `/bios-*` 快捷命令。若要在 Pi 中同时手工安装快捷命令，再把 `prompts/*.md` 复制到 `~/.pi/agent/prompts/`。随后重启 Pi 或开启新会话。
 
 ## 初始化记录目录
 
@@ -66,6 +90,29 @@ python bios-worklog/scripts/bios_worklog.py init "D:\BIOS-KnowledgeBase"
 默认目录保存在 `~/.bios-worklog/config.json`。
 
 ## 使用示例
+
+Pi Package 会注册以下快捷命令，输入 `/bios-` 即可在补全列表中选择：
+
+```text
+/bios-init D:\BIOS-KnowledgeBase
+/bios-issue [简短标题或补充说明]
+/bios-feature [简短标题或补充说明]
+/bios-checkpoint [进展摘要]
+/bios-pause [交接说明]
+/bios-resume [记录 ID]
+/bios-context <记录 ID>
+/bios-solve [根因、方案或验证补充]
+/bios-complete [最终方案或验证补充]
+/bios-reopen <记录 ID> [复现补充]
+/bios-status
+/bios-list [筛选条件]
+/bios-search <关键词或筛选表达式>
+/bios-reindex
+/bios-validate
+/bios-doctor
+```
+
+标准 Skill 命令仍然可用：
 
 ```text
 /skill:bios-worklog start-issue

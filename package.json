@@ -1,0 +1,20 @@
+{
+  "name": "bios-worklog-skill",
+  "version": "0.2.0",
+  "description": "BIOS issue investigation and feature implementation worklog skill for pi and other Agent Skills compatible harnesses.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "agent-skill",
+    "bios",
+    "worklog"
+  ],
+  "pi": {
+    "skills": [
+      "./bios-worklog"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  }
+}

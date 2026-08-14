@@ -20,6 +20,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bios_worklog.py"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("bios_worklog", SCRIPT)
 assert SPEC and SPEC.loader
 bios_worklog = importlib.util.module_from_spec(SPEC)
@@ -327,6 +328,39 @@ class BiosWorklogTests(unittest.TestCase):
         self.start_issue()
         with self.assertRaises(bios_worklog.WorklogError):
             self.kb.solve(None, {"root_cause": "x", "solution": "y"})
+
+    def test_pi_package_registers_skill_and_prompt_commands(self):
+        manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertIn("pi-package", manifest["keywords"])
+        self.assertEqual(manifest["pi"]["skills"], ["./bios-worklog"])
+        self.assertEqual(manifest["pi"]["prompts"], ["./prompts"])
+
+        expected_actions = {
+            "bios-init.md": "`init`",
+            "bios-issue.md": "`start-issue`",
+            "bios-feature.md": "`start-feature`",
+            "bios-checkpoint.md": "`checkpoint`",
+            "bios-pause.md": "`pause`",
+            "bios-resume.md": "`resume`",
+            "bios-context.md": "`context`",
+            "bios-solve.md": "`solve`",
+            "bios-complete.md": "`complete`",
+            "bios-reopen.md": "`reopen`",
+            "bios-status.md": "`status`",
+            "bios-list.md": "`list`",
+            "bios-search.md": "`search`",
+            "bios-reindex.md": "`reindex`",
+            "bios-validate.md": "`validate`",
+            "bios-doctor.md": "`doctor`",
+        }
+        prompt_dir = REPO_ROOT / "prompts"
+        self.assertEqual({path.name for path in prompt_dir.glob("*.md")}, set(expected_actions))
+        for filename, action in expected_actions.items():
+            text = (prompt_dir / filename).read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\n"), filename)
+            self.assertIn("description:", text, filename)
+            self.assertIn("`bios-worklog` skill", text, filename)
+            self.assertIn(action, text, filename)
 
     def test_cli_json_end_to_end(self):
         other_root = self.base / "cli-kb"
